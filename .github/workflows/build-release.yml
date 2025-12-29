@@ -70,9 +70,9 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release'
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
-            cp dist/${{ matrix.artifact_name }} dist/SD-Image-Browser-${{ steps.get_version.outputs.version }}.exe
+            cp dist/${{ matrix.artifact_name }} dist/SD-Image-Browser-${{ steps.get_version.outputs.version }}-Windows.exe
           else
-            cp dist/${{ matrix.artifact_name }} dist/SD-Image-Browser-${{ steps.get_version.outputs.version }}
+            cp dist/${{ matrix.artifact_name }} dist/SD-Image-Browser-${{ steps.get_version.outputs.version }}-Linux
           fi
         shell: bash
 
@@ -81,7 +81,7 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            dist/SD-Image-Browser-${{ steps.get_version.outputs.version }}${{ runner.os == 'Windows' && '.exe' || '' }}
+            dist/SD-Image-Browser-${{ steps.get_version.outputs.version }}-${{ runner.os == 'Windows' && 'Windows.exe' || 'Linux' }}
           name: Release ${{ github.ref_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
