@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+*.egg-info/
+dist/
+build/
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# PyInstaller
+*.spec.bak
+*.manifest
+*.exe.log

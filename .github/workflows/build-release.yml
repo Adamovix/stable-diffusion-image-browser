@@ -1,0 +1,87 @@
+name: Build and Release
+
+on:
+  release:
+    types: [published]
+  push:
+    tags:
+      - '*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: SD-Image-Browser.exe
+            asset_name: SD-Image-Browser-windows.exe
+          - os: ubuntu-latest
+            artifact_name: SD-Image-Browser
+            asset_name: SD-Image-Browser-linux
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract version
+        id: get_version
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            VERSION=${{ github.event.release.tag_name }}
+          else
+            VERSION=${GITHUB_REF#refs/tags/}
+          fi
+          # Remove 'v' prefix if present
+          VERSION=${VERSION#v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install pyinstaller'>=6.0.0' PyQt6'>=6.6.0' Pillow'>=10.0.0'
+
+      - name: Build with PyInstaller (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          pyinstaller sd_image_browser.spec --clean
+
+      - name: Build with PyInstaller (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          pyinstaller sd_image_browser.spec --clean
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: dist/${{ matrix.artifact_name }}
+          if-no-files-found: error
+
+      - name: Rename artifact with version
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release'
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp dist/${{ matrix.artifact_name }} dist/SD-Image-Browser-${{ steps.get_version.outputs.version }}.exe
+          else
+            cp dist/${{ matrix.artifact_name }} dist/SD-Image-Browser-${{ steps.get_version.outputs.version }}
+          fi
+        shell: bash
+
+      - name: Upload to Release
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            dist/SD-Image-Browser-${{ steps.get_version.outputs.version }}${{ runner.os == 'Windows' && '.exe' || '' }}
+          name: Release ${{ github.ref_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
