@@ -204,7 +204,6 @@ class MetadataCache:
             ''', fts_rows)
 
         self.conn.commit()
-        print(f"MetadataCache: Cached {len(image_rows)} images for {dir_key}")
 
     def is_cache_valid(self, directory: str, current_file_count: int) -> bool:
         """

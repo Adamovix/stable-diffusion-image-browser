@@ -1,7 +1,7 @@
 <div align="center">
   <h1> Stable Diffusion Image Browser </h1>
 
-![Version](https://img.shields.io/badge/version-1.0.0-blue)
+![Version](https://img.shields.io/badge/version-1.1.0-blue)
 ![Python](https://img.shields.io/badge/python-3.8+-green)
 ![License](https://img.shields.io/badge/license-MIT-orange)
 
@@ -37,8 +37,9 @@ A desktop application for browsing metadata from Stable Diffusion generated imag
   - Specific models - filter by model name
 
 ### Performance & Caching
+- **SQLite Database**: Indexed metadata cache with FTS5 full-text search
 - **Local Cache Directory**: `sd_cache/` folder in application directory
-  - Metadata cache: `sd_cache/metadata_cache.json`
+  - Metadata cache: `sd_cache/metadata.db`
   - Thumbnail cache: `sd_cache/thumbnails/*.jpg`
 - **Smart Cache Invalidation**: Automatically detects file changes
 - **Progressive Loading**: Smooth streaming when cache is populated
@@ -79,8 +80,9 @@ Output (Linux): `dist/SD-Image-Browser`
 - Regular photos won't have SD metadata so it won't be parsed
 
 **Slow loading?**
-
-Well, it's not exactly C++ or the most optimal code, first scan of new directory would take some time to build cache.
+- First scan of a directory builds the metadata cache
+- Subsequent loads awill be faster thanks to caching
+- Progress bar shows scanning status
 
 ## Contributing
 

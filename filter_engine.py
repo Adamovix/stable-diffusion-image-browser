@@ -36,7 +36,6 @@ class FilterEngine:
     def _build_indices(self):
         """Build filter indices from cached metadata (fast - single SQL query)."""
         if not self.cache or not hasattr(self.cache, 'conn'):
-            print("FilterEngine: No cache or no database connection")
             return
 
         import os
@@ -84,8 +83,6 @@ class FilterEngine:
                 else:
                     self.images_without_model.add(path)
 
-        print(f"FilterEngine: Built indices for {row_count} images in {dir_key}")
-
     def apply_filters(self, model_filter: str, prompt_filter: str) -> List[Tuple[str, dict]]:
         """
         Apply filters using pre-computed indices (instant - O(1) lookups).
@@ -132,7 +129,6 @@ class FilterEngine:
             if metadata:
                 result.append((path, metadata))
 
-        print(f"FilterEngine: Filtered to {len(result)} images (model={model_filter}, prompt={prompt_filter})")
         return result
 
     def _filter_prompts_fallback(self, candidates: Set[str], search_terms: List[str]) -> Set[str]:
