@@ -1,14 +1,15 @@
 """
 Metadata cache system for storing and retrieving image metadata.
-Uses JSON file for persistence between sessions.
+Uses SQLite database for fast indexing and querying.
 Also caches pre-generated thumbnails for faster loading.
 """
+import sqlite3
 import json
 import os
 import sys
 import hashlib
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional, Dict, List, Tuple
 from datetime import datetime
 
 from metadata_parser import SDMetadata
@@ -31,14 +32,14 @@ def get_application_directory() -> str:
 
 
 class MetadataCache:
-    """Manages persistent cache of image metadata and thumbnails."""
+    """Manages persistent cache of image metadata (SQLite) and thumbnails (files)."""
 
     def __init__(self, cache_dir: Optional[str] = None):
         """
-        Initialize metadata cache.
+        Initialize metadata cache with SQLite database.
 
         Args:
-            cache_dir: Directory to store cache file. Defaults to 'sd_cache' in application directory.
+            cache_dir: Directory to store cache files. Defaults to 'sd_cache' in application directory.
         """
         if cache_dir is None:
             app_dir = get_application_directory()
@@ -51,66 +52,158 @@ class MetadataCache:
         self.thumbnails_dir = os.path.join(cache_dir, 'thumbnails')
         os.makedirs(self.thumbnails_dir, exist_ok=True)
 
-        self.cache_file = os.path.join(cache_dir, 'metadata_cache.json')
-        self.cache_data = self._load_cache()
+        # SQLite database for metadata
+        self.db_path = os.path.join(cache_dir, 'metadata.db')
+        self.conn = sqlite3.connect(self.db_path)
+        self.conn.row_factory = sqlite3.Row  # Access columns by name
+        self._create_tables()
 
-    def _load_cache(self) -> dict:
-        """Load cache from disk."""
-        if os.path.exists(self.cache_file):
-            try:
-                with open(self.cache_file, 'r') as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, IOError) as e:
-                print(f"Error loading cache: {e}")
-                return {}
-        return {}
+    def _create_tables(self):
+        """Create database tables if they don't exist."""
+        cursor = self.conn.cursor()
 
-    def _save_cache(self):
-        """Save cache to disk."""
-        try:
-            with open(self.cache_file, 'w') as f:
-                json.dump(self.cache_data, f, indent=2)
-        except IOError as e:
-            print(f"Error saving cache: {e}")
+        # Directory-level cache table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS directories (
+                path TEXT PRIMARY KEY,
+                file_count INTEGER,
+                last_scan TIMESTAMP,
+                model_stats_json TEXT
+            )
+        ''')
+
+        # Image-level metadata table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS images (
+                path TEXT PRIMARY KEY,
+                directory TEXT,
+                mtime REAL,
+                model_name TEXT,
+                positive_prompt TEXT,
+                negative_prompt TEXT,
+                seed INTEGER,
+                steps INTEGER,
+                cfg_scale REAL,
+                sampler TEXT,
+                width INTEGER,
+                height INTEGER,
+                loras_json TEXT,
+                FOREIGN KEY (directory) REFERENCES directories(path)
+            )
+        ''')
+
+        # Create indexes for fast lookups
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_images_directory ON images(directory)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_images_model ON images(model_name)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_images_mtime ON images(mtime)')
+
+        # Full-text search table for prompts (FTS5 for fast text search)
+        cursor.execute('''
+            CREATE VIRTUAL TABLE IF NOT EXISTS prompts_fts USING fts5(
+                path UNINDEXED,
+                positive_prompt,
+                negative_prompt
+            )
+        ''')
+
+        self.conn.commit()
 
     def get_directory_cache(self, directory: str) -> Optional[dict]:
         """
-        Get cached data for a directory.
+        Get cached statistics for a directory.
 
-        Returns dict with:
-            - 'model_counts': dict of model_name -> count
-            - 'images': dict of image_path -> metadata dict
-            - 'timestamp': when cache was created
-            - 'file_count': number of files
+        Returns dict with model_stats if available.
         """
         dir_key = os.path.abspath(directory)
-        return self.cache_data.get(dir_key)
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'SELECT model_stats_json FROM directories WHERE path = ?',
+            (dir_key,)
+        )
+        row = cursor.fetchone()
+        if row and row['model_stats_json']:
+            return json.loads(row['model_stats_json'])
+        return None
 
     def set_directory_cache(self, directory: str, model_counts: dict, images_metadata: dict, model_stats: Optional[dict] = None):
         """
-        Cache metadata for a directory.
+        Cache metadata for a directory in SQLite database.
 
         Args:
             directory: Directory path
-            model_counts: dict of model_name -> count
+            model_counts: dict of model_name -> count (included in model_stats)
             images_metadata: dict of image_path -> metadata dict
             model_stats: Optional dict with full statistics (model_counts, total_images, etc.)
         """
         dir_key = os.path.abspath(directory)
 
-        cache_entry = {
-            'model_counts': model_counts,
-            'images': images_metadata,
-            'timestamp': datetime.now().isoformat(),
-            'file_count': len(images_metadata)
-        }
+        # Begin transaction for atomic updates
+        cursor = self.conn.cursor()
 
-        # Add model_stats if provided
-        if model_stats:
-            cache_entry['model_stats'] = model_stats
+        # Insert or update directory entry
+        cursor.execute('''
+            INSERT OR REPLACE INTO directories (path, file_count, last_scan, model_stats_json)
+            VALUES (?, ?, ?, ?)
+        ''', (dir_key, len(images_metadata), datetime.now().isoformat(),
+              json.dumps(model_stats) if model_stats else None))
 
-        self.cache_data[dir_key] = cache_entry
-        self._save_cache()
+        # Delete old images for this directory (FTS first, then images)
+        cursor.execute('''
+            DELETE FROM prompts_fts WHERE path IN
+            (SELECT path FROM images WHERE directory = ?)
+        ''', (dir_key,))
+        cursor.execute('DELETE FROM images WHERE directory = ?', (dir_key,))
+
+        # Bulk insert images (include ALL images, even without metadata)
+        image_rows = []
+        fts_rows = []
+        for img_path, meta_dict in images_metadata.items():
+            # Get mtime for cache invalidation
+            mtime = os.path.getmtime(img_path) if os.path.exists(img_path) else 0
+
+            if meta_dict:
+                # Image has SD metadata
+                loras_json = json.dumps(meta_dict.get('loras', [])) if meta_dict.get('loras') else None
+                image_rows.append((
+                    img_path, dir_key, mtime,
+                    meta_dict.get('model_name'), meta_dict.get('positive_prompt'),
+                    meta_dict.get('negative_prompt'), meta_dict.get('seed'),
+                    meta_dict.get('steps'), meta_dict.get('cfg_scale'),
+                    meta_dict.get('sampler'),
+                    meta_dict.get('size', [None, None])[0] if meta_dict.get('size') else None,
+                    meta_dict.get('size', [None, None])[1] if meta_dict.get('size') else None,
+                    loras_json
+                ))
+
+                # Add to FTS if has prompts
+                if meta_dict.get('positive_prompt') or meta_dict.get('negative_prompt'):
+                    fts_rows.append((
+                        img_path,
+                        meta_dict.get('positive_prompt') or '',
+                        meta_dict.get('negative_prompt') or ''
+                    ))
+            else:
+                # Image without SD metadata - store with NULL values
+                image_rows.append((
+                    img_path, dir_key, mtime,
+                    None, None, None, None, None, None, None, None, None, None
+                ))
+
+        if image_rows:
+            cursor.executemany('''
+                INSERT OR REPLACE INTO images
+                (path, directory, mtime, model_name, positive_prompt, negative_prompt,
+                 seed, steps, cfg_scale, sampler, width, height, loras_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', image_rows)
+
+        if fts_rows:
+            cursor.executemany('''
+                INSERT INTO prompts_fts (path, positive_prompt, negative_prompt)
+                VALUES (?, ?, ?)
+            ''', fts_rows)
+
+        self.conn.commit()
 
     def is_cache_valid(self, directory: str, current_file_count: int) -> bool:
         """
@@ -123,24 +216,41 @@ class MetadataCache:
         Returns:
             True if cache exists and file count matches
         """
-        cache = self.get_directory_cache(directory)
-        if not cache:
-            return False
-
-        # Check if file count matches
-        if cache.get('file_count') != current_file_count:
-            return False
-
-        return True
+        dir_key = os.path.abspath(directory)
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'SELECT file_count FROM directories WHERE path = ?',
+            (dir_key,)
+        )
+        row = cursor.fetchone()
+        return row is not None and row['file_count'] == current_file_count
 
     def get_image_metadata(self, directory: str, image_path: str) -> Optional[dict]:
-        """Get cached metadata for a specific image."""
-        cache = self.get_directory_cache(directory)
-        if not cache:
+        """Get cached metadata for a specific image from SQLite."""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT model_name, positive_prompt, negative_prompt, seed, steps,
+                   cfg_scale, sampler, width, height, loras_json
+            FROM images WHERE path = ? AND directory = ?
+        ''', (image_path, os.path.abspath(directory)))
+
+        row = cursor.fetchone()
+        if not row:
             return None
 
-        images = cache.get('images', {})
-        return images.get(image_path)
+        # Convert row to dict
+        meta_dict = {
+            'model_name': row['model_name'],
+            'positive_prompt': row['positive_prompt'],
+            'negative_prompt': row['negative_prompt'],
+            'seed': row['seed'],
+            'steps': row['steps'],
+            'cfg_scale': row['cfg_scale'],
+            'sampler': row['sampler'],
+            'size': (row['width'], row['height']) if row['width'] and row['height'] else None,
+            'loras': json.loads(row['loras_json']) if row['loras_json'] else []
+        }
+        return meta_dict
 
     def metadata_to_dict(self, metadata: Optional[SDMetadata]) -> Optional[dict]:
         """Convert SDMetadata object to dictionary for caching."""
@@ -178,16 +288,62 @@ class MetadataCache:
         return metadata
 
     def clear_cache(self):
-        """Clear all cached data."""
-        self.cache_data = {}
-        self._save_cache()
+        """Clear all cached metadata from database."""
+        cursor = self.conn.cursor()
+        cursor.execute('DELETE FROM directories')
+        cursor.execute('DELETE FROM images')
+        cursor.execute('DELETE FROM prompts_fts')
+        self.conn.commit()
 
     def remove_directory_cache(self, directory: str):
-        """Remove cache for a specific directory."""
+        """Remove cache for a specific directory from database."""
         dir_key = os.path.abspath(directory)
-        if dir_key in self.cache_data:
-            del self.cache_data[dir_key]
-            self._save_cache()
+        cursor = self.conn.cursor()
+        cursor.execute('DELETE FROM images WHERE directory = ?', (dir_key,))
+        cursor.execute('DELETE FROM prompts_fts WHERE path IN (SELECT path FROM images WHERE directory = ?)', (dir_key,))
+        cursor.execute('DELETE FROM directories WHERE path = ?', (dir_key,))
+        self.conn.commit()
+
+    def filter_by_prompt(self, directory: str, search_terms: List[str]) -> List[str]:
+        """
+        Use FTS (Full-Text Search) to quickly find images matching prompt terms.
+
+        Args:
+            directory: Directory to search in
+            search_terms: List of search terms (all must match - AND logic)
+
+        Returns:
+            List of image paths matching the search
+        """
+        if not search_terms:
+            return []
+
+        dir_key = os.path.abspath(directory)
+
+        # Build FTS query - AND all terms together
+        # FTS5 syntax: term1 AND term2 AND term3
+        fts_query = ' AND '.join(search_terms)
+
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT p.path FROM prompts_fts p
+            INNER JOIN images i ON p.path = i.path
+            WHERE i.directory = ? AND prompts_fts MATCH ?
+        ''', (dir_key, fts_query))
+
+        return [row['path'] for row in cursor.fetchall()]
+
+    def close(self):
+        """Close database connection."""
+        if self.conn:
+            self.conn.close()
+
+    def __del__(self):
+        """Ensure database connection is closed on cleanup."""
+        self.close()
+
+    # ===== Thumbnail Cache Methods (File-based) =====
+    # These remain unchanged - file-based cache works well for binary data
 
     def _get_thumbnail_cache_path(self, image_path: str) -> str:
         """
