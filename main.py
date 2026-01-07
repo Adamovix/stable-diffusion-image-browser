@@ -11,16 +11,21 @@ from collections import Counter
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QTreeView, QScrollArea, QLabel, QTextEdit, QPushButton,
-    QLineEdit, QGridLayout, QFrame, QComboBox,
+    QLineEdit, QGridLayout, QFrame, QComboBox, QListWidget, QListWidgetItem,
     QGroupBox, QSizePolicy, QProgressDialog, QTabWidget, QProgressBar
 )
-from PyQt6.QtCore import Qt, QDir, QSize, QThread, pyqtSignal, QModelIndex, QTimer, QUrl, QMimeData
+from PyQt6.QtCore import (
+    Qt, QDir, QSize, QThread, pyqtSignal, QModelIndex, QTimer, QUrl,
+    QMimeData, QThreadPool
+)
 from PyQt6.QtGui import QPixmap, QImage, QIcon, QFileSystemModel, QDrag, QDesktopServices
 
 from PIL import Image
 
 from metadata_parser import extract_metadata, get_metadata_summary, SDMetadata
 from metadata_cache import MetadataCache
+from thumbnail_loader import ThumbnailLoader
+from filter_engine import FilterEngine
 
 
 class ImageThumbnail(QFrame):
@@ -62,7 +67,7 @@ class ImageThumbnail(QFrame):
         layout.addWidget(self.name_label)
         self.setLayout(layout)
 
-        # Don't load thumbnail immediately - will be loaded later by ImageGridView
+        # Don't load thumbnail immediately - will be loaded later by VirtualImageGridView
 
     def load_thumbnail(self):
         """Load and display thumbnail of the image."""
@@ -199,8 +204,8 @@ class ImageThumbnail(QFrame):
         super().mouseMoveEvent(event)
 
 
-class ImageGridView(QScrollArea):
-    """Scrollable grid view for displaying image thumbnails."""
+class VirtualImageGridView(QListWidget):
+    """Virtual scrolling grid view - only creates widgets for visible items."""
 
     image_selected = pyqtSignal(str)  # Emits selected image path
     progress_show = pyqtSignal(str, int)  # Emits (message, maximum)
@@ -209,355 +214,195 @@ class ImageGridView(QScrollArea):
 
     def __init__(self, metadata_cache: Optional['MetadataCache'] = None, parent=None):
         super().__init__(parent)
-        self.setWidgetResizable(True)
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
-        # Container widget for grid
-        self.container = QWidget()
-        self.grid_layout = QGridLayout()
-        self.grid_layout.setSpacing(10)
-        self.grid_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        self.container.setLayout(self.grid_layout)
-        self.setWidget(self.container)
+        # Configure list widget for grid view with icons
+        self.setViewMode(QListWidget.ViewMode.IconMode)
+        self.setIconSize(QSize(200, 200))
+        self.setGridSize(QSize(220, 260))  # Icon (200) + text (40) + padding (20)
+        self.setUniformItemSizes(True)
+        self.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.setSpacing(10)
+        self.setWordWrap(True)
+        self.setMovement(QListWidget.Movement.Static)
 
-        self.thumbnails: List[ImageThumbnail] = []
+        # Enable drag and drop
+        self.setDragEnabled(True)
+        self.setDragDropMode(QListWidget.DragDropMode.DragOnly)
+
+        # Data storage
+        self.image_data: List[tuple] = []  # List of (path, metadata) tuples
         self.current_directory: Optional[str] = None
-        self.selected_thumbnail: Optional[ImageThumbnail] = None
-        self.metadata_cache = metadata_cache  # Cache for faster filtering
+        self.metadata_cache = metadata_cache
+        self.filter_engine: Optional[FilterEngine] = None  # Pre-computed filter indices
 
-        # Progressive loading
-        self.loading_index = 0
+        # Thumbnail loading tracking
+        self.loaded_items: set = set()  # Track which items have thumbnails loaded
         self.loading_timer = QTimer()
-        self.loading_timer.timeout.connect(self._load_next_batch)
+        self.loading_timer.timeout.connect(self._load_visible_range)
+        self.loading_batch_size = 20  # Load this many thumbnails per batch
 
-        # Dynamic column calculation
-        self.column_count = 4  # Default, will be recalculated
-        self.thumbnail_width = 220  # 200px thumbnail + 20px margin
-        self.min_columns = 1  # Minimum number of columns
-        self.max_columns = 8  # Maximum number of columns
+        # Thread pool for async thumbnail loading
+        self.thread_pool = QThreadPool()
+        self.thread_pool.setMaxThreadCount(4)  # Limit to 4 parallel loads
 
-    def calculate_columns(self) -> int:
-        """Calculate optimal number of columns based on available width."""
-        # Get available width (viewport width minus scrollbar if present)
-        available_width = self.viewport().width()
+        # Connect signals for lazy loading on scroll
+        self.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        self.itemClicked.connect(self._on_item_clicked)
+        self.itemDoubleClicked.connect(self._on_item_double_clicked)
 
-        # Calculate how many columns can fit
-        columns = max(self.min_columns, available_width // self.thumbnail_width)
+    def _on_scroll(self):
+        """Handle scroll events to load visible thumbnails."""
+        if not self.loading_timer.isActive():
+            self.loading_timer.start(50)  # Debounce scroll events
 
-        # Cap at maximum
-        columns = min(columns, self.max_columns)
+    def _on_item_clicked(self, item):
+        """Handle item click to emit selection signal."""
+        image_path = item.data(Qt.ItemDataRole.UserRole)
+        if image_path:
+            self.image_selected.emit(image_path)
 
-        return columns
+    def _on_item_double_clicked(self, item):
+        """Handle double-click to open image in default viewer."""
+        image_path = item.data(Qt.ItemDataRole.UserRole)
+        if image_path:
+            file_url = QUrl.fromLocalFile(image_path)
+            QDesktopServices.openUrl(file_url)
 
-    def resizeEvent(self, event):
-        """Handle resize events to recalculate columns."""
-        super().resizeEvent(event)
-
-        # Recalculate column count
-        new_column_count = self.calculate_columns()
-
-        # If column count changed and we have thumbnails, reorganize grid
-        if new_column_count != self.column_count and self.thumbnails:
-            self.column_count = new_column_count
-            self._reorganize_grid()
-
-    def _reorganize_grid(self):
-        """Reorganize thumbnails in grid with new column count."""
-        # Remove all widgets from grid (but don't delete them)
-        for i in reversed(range(self.grid_layout.count())):
-            self.grid_layout.itemAt(i).widget().setParent(None)
-
-        # Re-add thumbnails with new column layout
-        for idx, thumbnail in enumerate(self.thumbnails):
-            row = idx // self.column_count
-            col = idx % self.column_count
-            self.grid_layout.addWidget(thumbnail, row, col)
-
-        self.container.adjustSize()
-
-    def clear_grid(self):
-        """Clear all thumbnails from the grid."""
-        # Stop any ongoing loading
-        self.loading_timer.stop()
-        self.loading_index = 0
-
-        for thumbnail in self.thumbnails:
-            thumbnail.deleteLater()
-        self.thumbnails.clear()
-        self.selected_thumbnail = None  # Clear selection reference
-
-        # Process deletion events immediately to clear visual display
-        QApplication.processEvents()
-
-    def _load_next_batch(self):
-        """Load the next batch of thumbnails progressively (legacy method for compatibility)."""
-        # Batch size - load this many thumbnails at a time
-        batch_size = 5
-
-        # Calculate end index for this batch
-        end_index = min(self.loading_index + batch_size, len(self.thumbnails))
-
-        # Load thumbnails in this batch
-        for i in range(self.loading_index, end_index):
-            self.thumbnails[i].load_thumbnail()
-
-        # Update loading index
-        self.loading_index = end_index
-
-        # Stop timer if all thumbnails are loaded
-        if self.loading_index >= len(self.thumbnails):
-            self.loading_timer.stop()
-
-    def _load_thumbnails_progressive(self, filtered_files: list):
-        """
-        Fast progressive loading for cached thumbnails.
-        Creates widgets and loads thumbnails in small batches without blocking.
-        Gives responsive, streaming feel.
-        """
-        # Store filtered files for progressive loading
-        self.pending_files = filtered_files
-        self.loading_index = 0
-
-        # Show progress bar
-        self.progress_show.emit("Loading thumbnails", len(filtered_files))
-
-        # Start timer for progressive loading
-        self.loading_timer.stop()
-        try:
-            self.loading_timer.timeout.disconnect()
-        except:
-            pass  # No connections to disconnect
-        self.loading_timer.timeout.connect(self._load_next_progressive_batch)
-        self.loading_timer.start(10)  # Very fast, 10ms between batches
-
-    def _load_next_progressive_batch(self):
-        """Load next batch of thumbnails progressively (widget creation + thumbnail loading)."""
-        if not hasattr(self, 'pending_files') or self.loading_index >= len(self.pending_files):
-            self.loading_timer.stop()
-            self.container.adjustSize()
-            self.progress_hide.emit()  # Hide progress when done
+    def startDrag(self, supportedActions):
+        """Handle drag operation to enable dragging images to other applications."""
+        item = self.currentItem()
+        if not item:
             return
 
-        # Batch size: create and load this many at once
-        # Smaller = more responsive, larger = faster overall
-        batch_size = 10
+        image_path = item.data(Qt.ItemDataRole.UserRole)
+        if not image_path:
+            return
 
-        end_idx = min(self.loading_index + batch_size, len(self.pending_files))
+        drag = QDrag(self)
+        mime_data = QMimeData()
 
-        for i in range(self.loading_index, end_idx):
-            img_path, metadata = self.pending_files[i]
+        # Set file URL for drag and drop
+        file_url = QUrl.fromLocalFile(image_path)
+        mime_data.setUrls([file_url])
+        drag.setMimeData(mime_data)
 
-            row = i // self.column_count
-            col = i % self.column_count
+        # Set drag pixmap (thumbnail preview)
+        icon = item.icon()
+        if not icon.isNull():
+            pixmap = icon.pixmap(128, 128)
+            drag.setPixmap(pixmap)
 
-            # Create widget
-            thumbnail = ImageThumbnail(img_path, self.metadata_cache)
-            thumbnail.metadata = metadata
-            thumbnail.clicked.connect(self._on_thumbnail_clicked)
+        drag.exec(Qt.DropAction.CopyAction)
 
-            # Add to grid and list
-            self.grid_layout.addWidget(thumbnail, row, col)
-            self.thumbnails.append(thumbnail)
+    def clear_grid(self):
+        """Clear all items from the grid."""
+        self.loading_timer.stop()
+        self.clear()
+        self.image_data.clear()
+        self.loaded_items.clear()
+        self.current_directory = None
 
-            # Load thumbnail immediately (fast since cached)
-            thumbnail.load_thumbnail()
+    def _load_visible_range(self):
+        """Load thumbnails for currently visible items only."""
+        self.loading_timer.stop()
 
-        self.loading_index = end_idx
+        if not self.image_data:
+            return
 
-        # Update progress
-        self.progress_update.emit(end_idx, "Loading thumbnails")
+        # Get viewport rect to determine visible area
+        viewport_rect = self.viewport().rect()
 
-        # Process events to keep UI responsive
-        QApplication.processEvents()
+        # Find visible items (with buffer above and below)
+        items_to_load = []
+        for i in range(self.count()):
+            item = self.item(i)
+            if not item:
+                continue
 
-    def _load_thumbnails_with_progress(self, filtered_files: list):
-        """
-        Load thumbnails with progress bar for first-time load.
-        Creates widgets and loads thumbnails together in batches for immediate visual feedback.
-        """
-        # Show progress for loading thumbnails
-        self.progress_show.emit("Loading thumbnails", len(filtered_files))
+            # Check if item is visible or near visible area (buffer zone)
+            item_rect = self.visualItemRect(item)
+            if viewport_rect.intersects(item_rect.adjusted(0, -500, 0, 500)):  # 500px buffer
+                item_index = i
+                if item_index not in self.loaded_items:
+                    items_to_load.append((item_index, item))
 
-        # Create and load thumbnails in batches for immediate feedback
-        batch_size = 5  # Create and load this many at once
+        # Load thumbnails for visible items (up to batch size)
+        for idx, (item_index, item) in enumerate(items_to_load[:self.loading_batch_size]):
+            image_path = item.data(Qt.ItemDataRole.UserRole)
+            if image_path:
+                self._load_thumbnail_for_item(item, image_path)
+                self.loaded_items.add(item_index)
 
-        for idx, (img_path, metadata) in enumerate(filtered_files):
-            # Update progress at start of each batch
-            if idx % batch_size == 0:
-                self.progress_update.emit(idx, "Loading thumbnails")
+    def _load_thumbnail_for_item(self, item, image_path: str):
+        """Load thumbnail for a single item asynchronously using thread pool."""
+        # Create thumbnail loader worker
+        loader = ThumbnailLoader(image_path, self.metadata_cache)
 
-            row = idx // self.column_count
-            col = idx % self.column_count
+        # Connect signals for callback when thumbnail is loaded
+        loader.signals.finished.connect(
+            lambda path, pixmap: self._on_thumbnail_loaded(path, pixmap, item)
+        )
+        loader.signals.error.connect(
+            lambda path, error: print(f"Error loading thumbnail {path}: {error}")
+        )
 
-            # Create widget
-            thumbnail = ImageThumbnail(img_path, self.metadata_cache)
-            thumbnail.metadata = metadata
-            thumbnail.clicked.connect(self._on_thumbnail_clicked)
+        # Submit to thread pool for background execution
+        self.thread_pool.start(loader)
 
-            self.grid_layout.addWidget(thumbnail, row, col)
-            self.thumbnails.append(thumbnail)
-
-            # Load thumbnail immediately (create + load together)
-            thumbnail.load_thumbnail()
-
-            # Process events at end of each batch to show progress
-            if (idx + 1) % batch_size == 0:
-                QApplication.processEvents()
-
-        # Update progress to 100%
-        self.progress_update.emit(len(filtered_files), "Loading thumbnails")
-
-        # Update layout
-        self.container.adjustSize()
-
-        # Hide progress when done
-        self.progress_hide.emit()
+    def _on_thumbnail_loaded(self, image_path: str, pixmap: QPixmap, item: QListWidgetItem):
+        """Callback when thumbnail is loaded in background thread."""
+        # Update UI on main thread (safe because signal/slot mechanism)
+        if not pixmap.isNull():
+            # Scale pixmap to fit icon size if needed (maintain aspect ratio)
+            scaled_pixmap = pixmap.scaled(
+                200, 200,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            item.setIcon(QIcon(scaled_pixmap))
 
     def load_images(self, directory: str, filter_model: str = "", filter_prompt: str = ""):
-        """Load images from directory and display in grid."""
+        """Load images from directory and display in grid (virtual scrolling + instant filtering)."""
         try:
             self.clear_grid()
-            # Process any pending delete events before proceeding
-            QApplication.processEvents()
-            self.current_directory = directory
 
             if not os.path.isdir(directory):
                 return
 
-            # Supported image formats
-            extensions = ['.png', '.jpg', '.jpeg', '.webp']
-            image_files_set = set()  # Use set to avoid duplicates on Windows
+            # Build filter engine if directory changed (pre-computes indices)
+            if self.current_directory != directory:
+                self.current_directory = directory
+                self.progress_show.emit("Building filter indices", 0)
+                self.filter_engine = FilterEngine(directory, self.metadata_cache)
+                self.progress_hide.emit()
 
-            for ext in extensions:
-                image_files_set.update(Path(directory).glob(f"*{ext}"))
-                image_files_set.update(Path(directory).glob(f"*{ext.upper()}"))
-
-            # Convert back to list
-            image_files = list(image_files_set)
-
-            if not image_files:
-                return
-
-            # Sort by modification time (newest first)
-            image_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-
-            # Show progress bar for filtering
-            self.progress_show.emit("Loading images", len(image_files))
-
-            # Apply filters
-            filtered_files = []
-            for i, img_path in enumerate(image_files):
-                # Update progress
-                if i % 10 == 0:  # Update every 10 images to avoid slowdown
-                    self.progress_update.emit(i, "Loading images")
-
-                try:
-                    # Try to get metadata from cache first, otherwise extract
-                    metadata = None
-                    if self.metadata_cache:
-                        cached_meta_dict = self.metadata_cache.get_image_metadata(directory, str(img_path))
-                        if cached_meta_dict:
-                            metadata = self.metadata_cache.dict_to_metadata(cached_meta_dict)
-
-                    # If not in cache, extract it
-                    if not metadata:
-                        metadata = extract_metadata(str(img_path))
-
-                    # Apply model filter
-                    if filter_model == "__ALL_IMAGES__":
-                        # Show all images, no filtering by metadata
-                        pass
-                    elif filter_model == "__ALL_MODELS__":
-                        # Show only images with SD prompts
-                        if not metadata or not metadata.positive_prompt:
-                            continue
-                    elif filter_model == "__UNKNOWN_MODEL__":
-                        # Show images with prompt but no model name
-                        if not metadata or not metadata.positive_prompt:
-                            continue
-                        if metadata.model_name:
-                            continue
-                    elif filter_model:
-                        # Specific model filter
-                        if not metadata or not metadata.model_name:
-                            continue
-                        if filter_model.lower() not in metadata.model_name.lower():
-                            continue
-
-                    # Apply prompt filter (supports comma-separated terms - all must match)
-                    if filter_prompt:
-                        if not metadata or not metadata.positive_prompt:
-                            continue
-                        # Defensive check: ensure positive_prompt is a string
-                        prompt_text = str(metadata.positive_prompt) if metadata.positive_prompt else ""
-                        prompt_text_lower = prompt_text.lower()
-
-                        # Split by comma and check all terms are present
-                        search_terms = [term.strip() for term in filter_prompt.split(',')]
-                        search_terms = [term for term in search_terms if term]  # Remove empty strings
-
-                        # All terms must be present (AND logic)
-                        if not all(term.lower() in prompt_text_lower for term in search_terms):
-                            continue
-
-                    filtered_files.append((str(img_path), metadata))
-
-                except Exception as e:
-                    # Skip images that cause errors but don't crash
-                    print(f"Error processing {img_path}: {e}")
-                    continue
-
-            # Update progress to 100%
-            self.progress_update.emit(len(image_files), "Loading images")
+            # Apply filters using pre-computed indices (INSTANT - 50-100ms)
+            if self.filter_engine:
+                filtered_files = self.filter_engine.apply_filters(filter_model, filter_prompt)
+            else:
+                filtered_files = []
 
             if not filtered_files:
-                self.progress_hide.emit()
                 return
 
-            # Calculate optimal column count based on current width
-            self.column_count = self.calculate_columns()
+            # Store filtered data
+            self.image_data = filtered_files
 
-            # Check cache hit rate to decide loading strategy
-            cache_hit_rate = 0.0
-            if self.metadata_cache and len(filtered_files) > 0:
-                cached_count = sum(1 for img_path, _ in filtered_files
-                                  if self.metadata_cache.get_cached_thumbnail(img_path) is not None)
-                cache_hit_rate = cached_count / len(filtered_files)
+            # Populate list with lightweight items, no widgets created yet
+            for img_path, metadata in filtered_files:
+                item = QListWidgetItem(Path(img_path).name)
+                item.setData(Qt.ItemDataRole.UserRole, img_path)
+                item.setSizeHint(QSize(220, 260))  # Match grid size for proper display
+                item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+                self.addItem(item)
 
-            # If most thumbnails are cached (>70%), use fast progressive loading
-            # Otherwise use progress dialog for slower first-time load
-            if cache_hit_rate > 0.7:
-                # Fast path: Progressive loading without progress dialog
-                self._load_thumbnails_progressive(filtered_files)
-            else:
-                # Slow path: Progress dialog for first-time load
-                self._load_thumbnails_with_progress(filtered_files)
+            # Load thumbnails for visible items
+            self._load_visible_range()
 
         except Exception as e:
             print(f"Error in load_images: {e}")
             import traceback
             traceback.print_exc()
-
-    def _on_thumbnail_clicked(self, image_path: str):
-        """Handle thumbnail click - update selection and emit signal."""
-        # Deselect previous thumbnail (with safety check for deleted objects)
-        if self.selected_thumbnail:
-            try:
-                self.selected_thumbnail.set_selected(False)
-            except RuntimeError:
-                # Thumbnail was already deleted
-                pass
-
-        # Find and select new thumbnail
-        for thumbnail in self.thumbnails:
-            if thumbnail.image_path == image_path:
-                thumbnail.set_selected(True)
-                self.selected_thumbnail = thumbnail
-                break
-
-        # Emit signal
-        self.image_selected.emit(image_path)
 
 
 class MetadataPanel(QWidget):
@@ -881,8 +726,8 @@ class MainWindow(QMainWindow):
         self.setup_directory_tree()
         left_center_splitter.addWidget(self.tree_view)
 
-        # Center panel: Image grid view
-        self.image_grid = ImageGridView(metadata_cache=self.metadata_cache)
+        # Center panel: Virtual image grid view
+        self.image_grid = VirtualImageGridView(metadata_cache=self.metadata_cache)
         self.image_grid.image_selected.connect(self.on_image_selected)
         self.image_grid.progress_show.connect(self.show_progress)
         self.image_grid.progress_update.connect(self.update_progress)
@@ -942,19 +787,16 @@ class MainWindow(QMainWindow):
         self.progress_bar.setMaximum(maximum)
         self.progress_bar.setFormat(f"{message} - %p%")
         self.progress_bar.show()
-        QApplication.processEvents()
 
     def update_progress(self, value: int, message: str = None):
         """Update progress bar value and optionally change message."""
         self.progress_bar.setValue(value)
         if message:
             self.progress_bar.setFormat(f"{message} - %p%")
-        QApplication.processEvents()
 
     def hide_progress(self):
         """Hide progress bar."""
         self.progress_bar.hide()
-        QApplication.processEvents()
 
     def setup_directory_tree(self):
         """Set up the directory tree view."""
@@ -1118,8 +960,9 @@ class MainWindow(QMainWindow):
             # Store metadata for caching
             images_metadata[str(img_path)] = self.metadata_cache.metadata_to_dict(metadata)
 
-            # Process events to keep UI responsive
-            QApplication.processEvents()
+            # Process events periodically to keep UI responsive (every 50 images)
+            if idx % 50 == 0:
+                QApplication.processEvents()
 
         # Update to 100%
         self.update_progress(total_images, "Loading directory")
